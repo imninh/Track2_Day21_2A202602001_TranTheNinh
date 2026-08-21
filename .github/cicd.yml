@@ -1,0 +1,122 @@
+name: MLOps CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'data/**.dvc'
+      - 'src/**.py'
+      - 'params.yaml'
+  workflow_dispatch:
+
+jobs:
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest tests/ -v
+
+  train:
+    name: Train
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      f1: ${{ steps.read_metrics.outputs.f1 }}
+      rollback_blocked: ${{ steps.rollback.outputs.blocked }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ fromJson(secrets.CLOUD_CREDENTIALS).aws_access_key_id }}
+      AWS_SECRET_ACCESS_KEY: ${{ fromJson(secrets.CLOUD_CREDENTIALS).aws_secret_access_key }}
+      AWS_DEFAULT_REGION: us-east-1
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+      MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pull data with DVC
+        run: dvc pull
+      - name: Train model
+        run: python src/train.py
+      - name: Read metrics
+        id: read_metrics
+        run: |
+          F1=$(python -c "import json;print(json.load(open('outputs/report.json'))['f1_score'])")
+          echo "f1=$F1" >> $GITHUB_OUTPUT
+      - name: Bonus 4 - Compare with previous F1 (rollback gate)
+        id: rollback
+        continue-on-error: true
+        run: |
+          aws s3 cp s3://${{ secrets.CLOUD_BUCKET }}/artifacts/current/report.json prev_report.json || echo "NO_PREV"
+          if [ -f prev_report.json ]; then
+            PREV=$(python -c "import json;print(json.load(open('prev_report.json'))['f1_score'])")
+            CUR=$(python -c "import json;print(json.load(open('outputs/report.json'))['f1_score'])")
+            if python -c "import sys; sys.exit(0 if float('$CUR')>=float('$PREV') else 1)"; then
+              echo "blocked=false" >> $GITHUB_OUTPUT
+            else
+              echo "blocked=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "blocked=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Upload model + report to S3
+        run: |
+          aws s3 cp models/model.joblib s3://${{ secrets.CLOUD_BUCKET }}/artifacts/current/model.joblib
+          aws s3 cp outputs/report.json s3://${{ secrets.CLOUD_BUCKET }}/artifacts/current/report.json
+      - name: Bonus 3 - Upload detail report + threshold artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-and-detail
+          path: |
+            outputs/report.json
+            outputs/detail.txt
+
+  quality-gate:
+    name: Quality Gate
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check quality gate
+        env:
+          F1: ${{ needs.train.outputs.f1 }}
+          BLOCKED: ${{ needs.train.outputs.rollback_blocked }}
+        run: |
+          python - <<'EOF'
+          import sys, os
+          f1 = float(os.environ["F1"])
+          blocked = str(os.environ["BLOCKED"]).lower() == "true"
+          if f1 < 0.65:
+              print(f"QUALITY GATE FAILED: f1 {f1:.4f} < 0.65")
+              sys.exit(1)
+          if blocked:
+              print("ROLBACK BLOCKED: new F1 < previous F1")
+              sys.exit(1)
+          print(f"QUALITY GATE PASSED: f1 {f1:.4f}")
+          EOF
+
+  release:
+    name: Release
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy to VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            sudo systemctl restart income-api
+            sleep 5
+            curl -f http://localhost:8080/healthz || exit 1
