@@ -117,6 +117,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
+            pip3 install scikit-learn==1.4.2
             sudo systemctl restart income-api
             sleep 5
             curl -f http://localhost:8080/healthz || exit 1
